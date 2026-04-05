@@ -519,7 +519,7 @@ class XRScholarScraper:
                 params["pn"] = page
 
             response = self._get(base_url, params=params)
-            journals, has_more = self._parse_category_journals(response.text, year, cat_type)
+            journals, has_more = self._parse_category_journals(response.text, year, cat_type, page)
             all_journals.extend(journals)
 
             if not has_more:
@@ -529,7 +529,7 @@ class XRScholarScraper:
         print(f"[+] Found {len(all_journals)} journal(s) in category")
         return all_journals
 
-    def _parse_category_journals(self, html: str, year: int, cat_type: str) -> tuple[list[dict], bool]:
+    def _parse_category_journals(self, html: str, year: int, cat_type: str, current_page: int = 1) -> tuple[list[dict], bool]:
         """Parse a category journal listing page. Returns (journals, has_more_pages)."""
         soup = BeautifulSoup(html, "html.parser")
         journals = []
@@ -579,24 +579,26 @@ class XRScholarScraper:
                 "source_category_type": cat_type,
             })
 
-        # Check for more pages
+        # Check for more pages by looking for next page link
         has_more = False
         for a in soup.select("a[href]"):
             href = a.get("href", "")
             text = a.get_text(strip=True)
-            if text.isdigit() and "pn=" in href:
-                current_pn = re.search(r"pn=(\d+)", href)
-                if current_pn:
+            pn_match = re.search(r"pn=(\d+)", href)
+            if pn_match:
+                page_num = int(pn_match.group(1))
+                if page_num == current_page + 1:
                     has_more = True
                     break
 
         # Also check pagination text like "显示第1–20条，共118条"
-        page_text = soup.get_text()
-        match = re.search(r"显示第\d+–(\d+)条，共(\d+)条", page_text)
-        if match:
-            shown = int(match.group(1))
-            total = int(match.group(2))
-            has_more = shown < total
+        if not has_more:
+            page_text = soup.get_text()
+            match = re.search(r"显示第\d+–(\d+)条，共(\d+)条", page_text)
+            if match:
+                shown = int(match.group(1))
+                total = int(match.group(2))
+                has_more = shown < total
 
         return journals, has_more
 
@@ -788,6 +790,12 @@ def _needs_full_details(expression: str) -> bool:
     for field_name in detail_only_fields:
         if field_name + ':' in expression.lower():
             return True
+    # Also check for standalone partition/top keywords that need detail data
+    # Listing results have partition and is_top, but search results don't
+    if re.search(r'\b\d+\s*区\b', expression):
+        return True
+    if re.search(r'\bTop\b', expression, re.IGNORECASE):
+        return True
     return False
 
 
@@ -1055,18 +1063,25 @@ Examples:
                         print(f"  {c['chinese_name']} / {c['english_name']}")
                     sys.exit(1)
 
-                # Check if keyword contains boolean operators
-                kw = args.keyword if has_keyword else ""
+                # For boolean expressions, browse without keyword and filter locally
+                kw = "" if (has_keyword and _has_boolean_ops(args.keyword)) else (args.keyword if has_keyword else "")
                 if args.fast:
                     results = scraper.browse_category(cat_id, "ZKY", args.year, kw, args.page_size)
-                    if has_keyword:
+                    if has_keyword and _has_boolean_ops(args.keyword):
                         results = filter_results(results, args.keyword)
                     journals.extend(_results_to_journals(results))
                 else:
                     results = scraper.browse_category(cat_id, "ZKY", args.year, kw, args.page_size)
-                    if has_keyword:
-                        results = filter_results(results, args.keyword)
-                    journals.extend(scraper._resolve_journals(results, args.year))
+                    if has_keyword and _has_boolean_ops(args.keyword):
+                        # Need full details for boolean filtering
+                        if _needs_full_details(args.keyword):
+                            journals = scraper._resolve_journals(results, args.year)
+                            journals = filter_journals(journals, args.keyword)
+                        else:
+                            results = filter_results(results, args.keyword)
+                            journals.extend(scraper._resolve_journals(results, args.year))
+                    else:
+                        journals.extend(scraper._resolve_journals(results, args.year))
 
             if has_minor:
                 cats = scraper.list_minor_categories(args.year)
@@ -1082,17 +1097,23 @@ Examples:
                         print(f"  {c['chinese_name']} / {c['english_name']}")
                     sys.exit(1)
 
-                kw = args.keyword if has_keyword else ""
+                kw = "" if (has_keyword and _has_boolean_ops(args.keyword)) else (args.keyword if has_keyword else "")
                 if args.fast:
                     results = scraper.browse_category(cat_id, "JCR", args.year, kw, args.page_size)
-                    if has_keyword:
+                    if has_keyword and _has_boolean_ops(args.keyword):
                         results = filter_results(results, args.keyword)
                     journals.extend(_results_to_journals(results))
                 else:
                     results = scraper.browse_category(cat_id, "JCR", args.year, kw, args.page_size)
-                    if has_keyword:
-                        results = filter_results(results, args.keyword)
-                    journals.extend(scraper._resolve_journals(results, args.year))
+                    if has_keyword and _has_boolean_ops(args.keyword):
+                        if _needs_full_details(args.keyword):
+                            journals = scraper._resolve_journals(results, args.year)
+                            journals = filter_journals(journals, args.keyword)
+                        else:
+                            results = filter_results(results, args.keyword)
+                            journals.extend(scraper._resolve_journals(results, args.year))
+                    else:
+                        journals.extend(scraper._resolve_journals(results, args.year))
 
             # Deduplicate by journal_id
             seen = set()
