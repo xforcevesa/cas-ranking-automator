@@ -1,6 +1,6 @@
-# CAS Ranking Automator (新锐期刊分区表爬虫工具)
+# 期刊分区助手 (CAS Ranking Automator)
 
-基于 Python `requests` + `BeautifulSoup` 的新锐期刊分区表爬虫工具，无需浏览器即可抓取期刊信息。
+基于 Python `requests` + `BeautifulSoup` 的新锐期刊分区表查询工具，无需浏览器即可获取期刊分区信息。
 
 ## 功能特性
 
