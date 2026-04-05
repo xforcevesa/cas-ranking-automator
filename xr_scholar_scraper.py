@@ -778,6 +778,43 @@ def _build_result_context(result: dict) -> dict:
     }
 
 
+def _needs_full_details(expression: str) -> bool:
+    """Check if a boolean expression needs full journal details for filtering."""
+    if not expression.strip():
+        return False
+    # Fields only available in full journal details (not in listing results)
+    detail_only_fields = {'publisher', 'language', 'database', 'major', 'minor'}
+    # Check if expression references any detail-only fields
+    for field_name in detail_only_fields:
+        if field_name + ':' in expression.lower():
+            return True
+    return False
+
+
+def _extract_search_keywords(expression: str) -> str:
+    """
+    Extract searchable keywords from a boolean expression.
+    Returns a combined keyword string for server-side search.
+    Only extracts values from fields that are searchable on the server
+    (name, issn, eissn, publisher). Ignores partition/top/major/minor
+    as those are filtered locally.
+
+    Examples:
+        "publisher:ELSEVIER AND 1区 AND Top" -> "ELSEVIER"
+        "name:Nature AND publisher:PORTFOLIO" -> "Nature PORTFOLIO"
+        "1区 AND Top" -> "" (no searchable keywords)
+    """
+    searchable_fields = {'name', 'issn', 'eissn', 'publisher'}
+    keywords = []
+    # Find all field:value pairs
+    for match in re.finditer(r'(\w+):(\S+)', expression):
+        field_name = match.group(1).lower()
+        value = match.group(2)
+        if field_name in searchable_fields:
+            keywords.append(value)
+    return ' '.join(keywords)
+
+
 def filter_journals(journals: list[Journal], expression: str) -> list[Journal]:
     """Filter journals using a boolean expression."""
     if not expression.strip():
@@ -1073,16 +1110,28 @@ Examples:
             # Keyword search mode
             # Check if keyword contains boolean operators
             if _has_boolean_ops(args.keyword):
-                # Fetch all results from server (use empty keyword to get all)
-                # then filter locally with boolean expression
+                # Extract searchable keywords from expression for server-side search
+                search_kw = _extract_search_keywords(args.keyword)
+
                 if args.fast:
-                    results = scraper.search_journals("", args.year)
+                    results = scraper.search_journals(search_kw, args.year)
                     results = filter_results(results, args.keyword)
                     journals = _results_to_journals(results)
                 else:
-                    results = scraper.search_journals("", args.year)
-                    results = filter_results(results, args.keyword)
-                    journals = scraper._resolve_journals(results, args.year)
+                    # If expression needs fields only in detail pages, fetch details first
+                    if _needs_full_details(args.keyword):
+                        results = scraper.search_journals(search_kw, args.year)
+                        journals = scraper._resolve_journals(results, args.year)
+                        journals = filter_journals(journals, args.keyword)
+                    else:
+                        results = scraper.search_journals(search_kw, args.year)
+                        results = filter_results(results, args.keyword)
+                        journals = scraper._resolve_journals(results, args.year)
+
+                # If no results and no searchable keywords, suggest category browsing
+                if not journals and not search_kw:
+                    print("[!] Tip: Use --category-major or --category-minor with this filter for better results.")
+                    print("    Example: python xr_scholar_scraper.py --category-major \"计算机科学\" --keyword \"{}\"".format(args.keyword))
             else:
                 # Simple keyword, use server-side search
                 if args.fast:
