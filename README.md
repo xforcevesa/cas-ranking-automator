@@ -1,4 +1,4 @@
-# 新锐期刊分区表爬虫工具 (XR-Scholar Journal Scraper)
+# CAS Ranking Automator (新锐期刊分区表爬虫工具)
 
 基于 Python `requests` + `BeautifulSoup` 的新锐期刊分区表爬虫工具，无需浏览器即可抓取期刊信息。
 
