@@ -114,14 +114,21 @@ class CacheManager:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_journals_cached_at ON journals(cached_at)")
 
-    def get_journal(self, journal_id: str, ttl: int = 86400) -> Optional[dict]:
-        """Get cached journal detail. Returns None if expired or not found."""
+    def get_journal(self, journal_id: str, ttl: int = -1) -> Optional[dict]:
+        """Get cached journal detail. Returns None if expired or not found.
+        ttl=-1 means permanent (no expiry)."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT * FROM journals WHERE journal_id = ? AND cached_at > ?",
-                (journal_id, time.time() - ttl)
-            ).fetchone()
+            if ttl == -1:
+                row = conn.execute(
+                    "SELECT * FROM journals WHERE journal_id = ?",
+                    (journal_id,)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM journals WHERE journal_id = ? AND cached_at > ?",
+                    (journal_id, time.time() - ttl)
+                ).fetchone()
             if not row:
                 return None
             return dict(row)
@@ -152,13 +159,19 @@ class CacheManager:
                 time.time(),
             ))
 
-    def get_search_results(self, cache_key: str, ttl: int = 86400) -> Optional[list[str]]:
-        """Get cached search result journal IDs."""
+    def get_search_results(self, cache_key: str, ttl: int = -1) -> Optional[list[str]]:
+        """Get cached search result journal IDs. ttl=-1 means permanent."""
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT journal_ids FROM search_cache WHERE cache_key = ? AND cached_at > ?",
-                (cache_key, time.time() - ttl)
-            ).fetchone()
+            if ttl == -1:
+                row = conn.execute(
+                    "SELECT journal_ids FROM search_cache WHERE cache_key = ?",
+                    (cache_key,)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT journal_ids FROM search_cache WHERE cache_key = ? AND cached_at > ?",
+                    (cache_key, time.time() - ttl)
+                ).fetchone()
             if row:
                 return json.loads(row[0])
             return None
@@ -171,13 +184,19 @@ class CacheManager:
                 (cache_key, json.dumps(journal_ids), time.time())
             )
 
-    def get_category_results(self, cache_key: str, ttl: int = 86400) -> Optional[list[str]]:
-        """Get cached category browse result journal IDs."""
+    def get_category_results(self, cache_key: str, ttl: int = -1) -> Optional[list[str]]:
+        """Get cached category browse result journal IDs. ttl=-1 means permanent."""
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT journal_ids FROM category_cache WHERE cache_key = ? AND cached_at > ?",
-                (cache_key, time.time() - ttl)
-            ).fetchone()
+            if ttl == -1:
+                row = conn.execute(
+                    "SELECT journal_ids FROM category_cache WHERE cache_key = ?",
+                    (cache_key,)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT journal_ids FROM category_cache WHERE cache_key = ? AND cached_at > ?",
+                    (cache_key, time.time() - ttl)
+                ).fetchone()
             if row:
                 return json.loads(row[0])
             return None
@@ -190,13 +209,19 @@ class CacheManager:
                 (cache_key, json.dumps(journal_ids), time.time())
             )
 
-    def get_category_list(self, cache_key: str, ttl: int = 86400) -> Optional[list[dict]]:
-        """Get cached category list."""
+    def get_category_list(self, cache_key: str, ttl: int = -1) -> Optional[list[dict]]:
+        """Get cached category list. ttl=-1 means permanent."""
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT categories FROM category_list_cache WHERE cache_key = ? AND cached_at > ?",
-                (cache_key, time.time() - ttl)
-            ).fetchone()
+            if ttl == -1:
+                row = conn.execute(
+                    "SELECT categories FROM category_list_cache WHERE cache_key = ?",
+                    (cache_key,)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT categories FROM category_list_cache WHERE cache_key = ? AND cached_at > ?",
+                    (cache_key, time.time() - ttl)
+                ).fetchone()
             if row:
                 return json.loads(row[0])
             return None
@@ -517,7 +542,7 @@ class XRScholarScraper:
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
 
-    def __init__(self, timeout: int = 30, delay: float = 1.0, cache: Optional[CacheManager] = None, cache_ttl: int = 86400):
+    def __init__(self, timeout: int = 30, delay: float = 1.0, cache: Optional[CacheManager] = None, cache_ttl: int = -1):
         self.timeout = timeout
         self.delay = delay
         self.cache = cache
@@ -1363,7 +1388,7 @@ Examples:
     parser.add_argument("--cache-stats", action="store_true", help="Show cache statistics and exit")
     parser.add_argument("--clear-cache", action="store_true", help="Clear all cached data and exit")
     parser.add_argument("--no-cache", action="store_true", help="Disable caching for this run")
-    parser.add_argument("--cache-ttl", type=int, default=86400, help="Cache TTL in seconds (default: 86400 = 24h)")
+    parser.add_argument("--cache-ttl", type=int, default=-1, help="Cache TTL in seconds (default: -1 = permanent, never expire)")
     parser.add_argument("--prefetch", "-p", action="store_true", help="Prefetch ALL matching journals and cache their details (supports all search modes)")
 
     args = parser.parse_args()
