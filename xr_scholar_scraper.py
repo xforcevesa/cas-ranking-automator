@@ -1334,6 +1334,11 @@ Examples:
   # Export filtered results to CSV
   %(prog)s --category-major "医学" --keyword "1区 AND Top" --output csv -f medicine_top.csv
 
+  # Prefetch: fetch ALL matching journals and cache details
+  %(prog)s --category-major "计算机科学" --prefetch
+  %(prog)s --category-major "计算机科学" --keyword "1区 AND Top" --prefetch
+  %(prog)s --keyword "Nature" --prefetch
+
   # Cache management
   %(prog)s --cache-stats
   %(prog)s --clear-cache
@@ -1355,6 +1360,7 @@ Examples:
     parser.add_argument("--clear-cache", action="store_true", help="Clear all cached data and exit")
     parser.add_argument("--no-cache", action="store_true", help="Disable caching for this run")
     parser.add_argument("--cache-ttl", type=int, default=86400, help="Cache TTL in seconds (default: 86400 = 24h)")
+    parser.add_argument("--prefetch", "-p", action="store_true", help="Prefetch ALL matching journals and cache their details (supports all search modes)")
 
     args = parser.parse_args()
 
@@ -1403,6 +1409,13 @@ Examples:
         if not has_keyword and not has_major and not has_minor:
             parser.error("At least one of --keyword, --category-major, or --category-minor is required.")
 
+        # Prefetch mode: always fetch all details and cache, regardless of --fast
+        if args.prefetch:
+            print("[*] Prefetch mode: fetching ALL matching journals and caching details...")
+            # Force non-fast, non-filtered browsing to get everything
+            orig_fast = args.fast
+            args.fast = False
+
         journals = []
 
         if has_major or has_minor:
@@ -1422,9 +1435,19 @@ Examples:
                         print(f"  {c['chinese_name']} / {c['english_name']}")
                     sys.exit(1)
 
-                # For boolean expressions, browse without keyword and filter locally
-                kw = "" if (has_keyword and _has_boolean_ops(args.keyword)) else (args.keyword if has_keyword else "")
-                if args.fast:
+                # For boolean expressions or prefetch, browse without keyword and filter locally
+                kw = "" if (has_keyword and (_has_boolean_ops(args.keyword) or args.prefetch)) else (args.keyword if has_keyword else "")
+
+                if args.prefetch:
+                    # Prefetch: browse all, resolve all details (cache them), then filter
+                    results = scraper.browse_category(cat_id, "ZKY", args.year, kw, args.page_size)
+                    print(f"[*] Prefetching {len(results)} journal details from major category...")
+                    all_j = scraper._resolve_journals(results, args.year)
+                    if has_keyword and _has_boolean_ops(args.keyword):
+                        journals.extend(filter_journals(all_j, args.keyword))
+                    else:
+                        journals.extend(all_j)
+                elif args.fast:
                     results = scraper.browse_category(cat_id, "ZKY", args.year, kw, args.page_size)
                     if has_keyword and _has_boolean_ops(args.keyword):
                         results = filter_results(results, args.keyword)
@@ -1456,8 +1479,17 @@ Examples:
                         print(f"  {c['chinese_name']} / {c['english_name']}")
                     sys.exit(1)
 
-                kw = "" if (has_keyword and _has_boolean_ops(args.keyword)) else (args.keyword if has_keyword else "")
-                if args.fast:
+                kw = "" if (has_keyword and (_has_boolean_ops(args.keyword) or args.prefetch)) else (args.keyword if has_keyword else "")
+
+                if args.prefetch:
+                    results = scraper.browse_category(cat_id, "JCR", args.year, kw, args.page_size)
+                    print(f"[*] Prefetching {len(results)} journal details from minor category...")
+                    all_j = scraper._resolve_journals(results, args.year)
+                    if has_keyword and _has_boolean_ops(args.keyword):
+                        journals.extend(filter_journals(all_j, args.keyword))
+                    else:
+                        journals.extend(all_j)
+                elif args.fast:
                     results = scraper.browse_category(cat_id, "JCR", args.year, kw, args.page_size)
                     if has_keyword and _has_boolean_ops(args.keyword):
                         results = filter_results(results, args.keyword)
@@ -1493,7 +1525,34 @@ Examples:
                 # Extract searchable keywords from expression for server-side search
                 search_kw = _extract_search_keywords(args.keyword)
 
-                if args.fast:
+                if args.prefetch:
+                    # For prefetch with boolean: if no searchable keywords, browse all categories
+                    if not search_kw:
+                        print("[*] No searchable keywords in expression, browsing all major categories for prefetch...")
+                        cats = scraper.list_major_categories(args.year)
+                        for c in cats:
+                            results = scraper.browse_category(c["category_id"], "ZKY", args.year, "", args.page_size)
+                            print(f"[*] Prefetching {len(results)} journal details from {c['chinese_name']}...")
+                            all_j = scraper._resolve_journals(results, args.year)
+                            journals.extend(filter_journals(all_j, args.keyword))
+                        # Deduplicate
+                        seen = set()
+                        unique = []
+                        for j in journals:
+                            key = j.journal_id or j.detail_url
+                            if key and key not in seen:
+                                seen.add(key)
+                                unique.append(j)
+                            elif not key:
+                                unique.append(j)
+                        journals = unique
+                    else:
+                        # Has searchable keywords - search and resolve all
+                        results = scraper.search_journals(search_kw, args.year)
+                        print(f"[*] Prefetching {len(results)} journal details...")
+                        all_j = scraper._resolve_journals(results, args.year)
+                        journals = filter_journals(all_j, args.keyword)
+                elif args.fast:
                     results = scraper.search_journals(search_kw, args.year)
                     results = filter_results(results, args.keyword)
                     journals = _results_to_journals(results)
@@ -1509,16 +1568,25 @@ Examples:
                         journals = scraper._resolve_journals(results, args.year)
 
                 # If no results and no searchable keywords, suggest category browsing
-                if not journals and not search_kw:
+                if not journals and not search_kw and not args.prefetch:
                     print("[!] Tip: Use --category-major or --category-minor with this filter for better results.")
                     print("    Example: python xr_scholar_scraper.py --category-major \"计算机科学\" --keyword \"{}\"".format(args.keyword))
             else:
                 # Simple keyword, use server-side search
-                if args.fast:
+                if args.prefetch:
+                    results = scraper.search_journals(args.keyword, args.year)
+                    print(f"[*] Prefetching {len(results)} journal details...")
+                    journals = scraper._resolve_journals(results, args.year)
+                elif args.fast:
                     results = scraper.search_journals(args.keyword, args.year)
                     journals = _results_to_journals(results)
                 else:
                     journals = scraper.search_and_get_details(args.keyword, args.year)
+
+        if args.prefetch:
+            print(f"[+] Prefetch complete: {len(journals)} journal(s) fetched and cached.")
+            # Restore original fast setting
+            args.fast = orig_fast
 
         if not journals:
             print("[!] No journals found.")
