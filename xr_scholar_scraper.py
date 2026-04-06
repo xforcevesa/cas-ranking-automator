@@ -36,12 +36,17 @@ Usage:
 
     # Export to CSV
     python xr_scholar_scraper.py --category-major "医学" --keyword "1区 AND Top" --output csv -f medicine_top.csv
+
+    # Clear cache
+    python xr_scholar_scraper.py --clear-cache
 """
 
 import argparse
 import csv
 import json
+import os
 import re
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
@@ -50,6 +55,184 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+
+
+# ============================================================
+# SQLite Cache Manager
+# ============================================================
+
+class CacheManager:
+    """SQLite-based cache for fetched journal data."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        """Initialize database tables."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS journals (
+                    journal_id TEXT PRIMARY KEY,
+                    name TEXT,
+                    issn TEXT,
+                    eissn TEXT,
+                    publisher TEXT,
+                    language TEXT,
+                    database_indexing TEXT,
+                    major_en TEXT,
+                    major_cn TEXT,
+                    major_partition TEXT,
+                    major_is_top INTEGER,
+                    minor_categories TEXT,  -- JSON array
+                    detail_url TEXT,
+                    cached_at REAL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS search_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    journal_ids TEXT,  -- JSON array
+                    cached_at REAL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS category_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    journal_ids TEXT,  -- JSON array
+                    cached_at REAL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS category_list_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    categories TEXT,  -- JSON array
+                    cached_at REAL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_journals_cached_at ON journals(cached_at)")
+
+    def get_journal(self, journal_id: str, ttl: int = 86400) -> Optional[dict]:
+        """Get cached journal detail. Returns None if expired or not found."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM journals WHERE journal_id = ? AND cached_at > ?",
+                (journal_id, time.time() - ttl)
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+
+    def save_journal(self, journal_id: str, data: dict):
+        """Save journal detail to cache."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO journals
+                (journal_id, name, issn, eissn, publisher, language, database_indexing,
+                 major_en, major_cn, major_partition, major_is_top, minor_categories,
+                 detail_url, cached_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                journal_id,
+                data.get("name", ""),
+                data.get("issn", ""),
+                data.get("eissn", ""),
+                data.get("publisher", ""),
+                data.get("language", ""),
+                data.get("database_indexing", ""),
+                data.get("major_en", ""),
+                data.get("major_cn", ""),
+                data.get("major_partition", ""),
+                1 if data.get("major_is_top") else 0,
+                json.dumps(data.get("minor_categories", []), ensure_ascii=False),
+                data.get("detail_url", ""),
+                time.time(),
+            ))
+
+    def get_search_results(self, cache_key: str, ttl: int = 86400) -> Optional[list[str]]:
+        """Get cached search result journal IDs."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT journal_ids FROM search_cache WHERE cache_key = ? AND cached_at > ?",
+                (cache_key, time.time() - ttl)
+            ).fetchone()
+            if row:
+                return json.loads(row[0])
+            return None
+
+    def save_search_results(self, cache_key: str, journal_ids: list[str]):
+        """Save search result journal IDs to cache."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO search_cache (cache_key, journal_ids, cached_at) VALUES (?, ?, ?)",
+                (cache_key, json.dumps(journal_ids), time.time())
+            )
+
+    def get_category_results(self, cache_key: str, ttl: int = 86400) -> Optional[list[str]]:
+        """Get cached category browse result journal IDs."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT journal_ids FROM category_cache WHERE cache_key = ? AND cached_at > ?",
+                (cache_key, time.time() - ttl)
+            ).fetchone()
+            if row:
+                return json.loads(row[0])
+            return None
+
+    def save_category_results(self, cache_key: str, journal_ids: list[str]):
+        """Save category browse result journal IDs to cache."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO category_cache (cache_key, journal_ids, cached_at) VALUES (?, ?, ?)",
+                (cache_key, json.dumps(journal_ids), time.time())
+            )
+
+    def get_category_list(self, cache_key: str, ttl: int = 86400) -> Optional[list[dict]]:
+        """Get cached category list."""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT categories FROM category_list_cache WHERE cache_key = ? AND cached_at > ?",
+                (cache_key, time.time() - ttl)
+            ).fetchone()
+            if row:
+                return json.loads(row[0])
+            return None
+
+    def save_category_list(self, cache_key: str, categories: list[dict]):
+        """Save category list to cache."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO category_list_cache (cache_key, categories, cached_at) VALUES (?, ?, ?)",
+                (cache_key, json.dumps(categories, ensure_ascii=False), time.time())
+            )
+
+    def clear(self):
+        """Clear all cached data."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM journals")
+            conn.execute("DELETE FROM search_cache")
+            conn.execute("DELETE FROM category_cache")
+            conn.execute("DELETE FROM category_list_cache")
+        print(f"[+] Cache cleared: {self.db_path}")
+
+    def stats(self) -> dict:
+        """Get cache statistics."""
+        with sqlite3.connect(self.db_path) as conn:
+            journals = conn.execute("SELECT COUNT(*) FROM journals").fetchone()[0]
+            searches = conn.execute("SELECT COUNT(*) FROM search_cache").fetchone()[0]
+            categories = conn.execute("SELECT COUNT(*) FROM category_cache").fetchone()[0]
+            cat_lists = conn.execute("SELECT COUNT(*) FROM category_list_cache").fetchone()[0]
+            size = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+            return {
+                "journals": journals,
+                "searches": searches,
+                "categories": categories,
+                "category_lists": cat_lists,
+                "size_mb": round(size / 1024 / 1024, 2),
+            }
 
 
 # ============================================================
@@ -334,9 +517,11 @@ class XRScholarScraper:
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
 
-    def __init__(self, timeout: int = 30, delay: float = 1.0):
+    def __init__(self, timeout: int = 30, delay: float = 1.0, cache: Optional[CacheManager] = None, cache_ttl: int = 86400):
         self.timeout = timeout
         self.delay = delay
+        self.cache = cache
+        self.cache_ttl = cache_ttl
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
 
@@ -353,10 +538,47 @@ class XRScholarScraper:
 
     def search_journals(self, keyword: str, year: int = 2026) -> list[dict]:
         """Search for journals by keyword."""
+        cache_key = f"search:{keyword}:{year}"
+
+        # Check cache
+        if self.cache:
+            cached_ids = self.cache.get_search_results(cache_key, self.cache_ttl)
+            if cached_ids is not None:
+                journals = []
+                for jid in cached_ids:
+                    cached = self.cache.get_journal(jid, self.cache_ttl)
+                    if cached:
+                        journals.append(self._cached_to_result(cached))
+                    else:
+                        # Cache miss for individual journal, fall through to network
+                        break
+                else:
+                    # All journals cached
+                    print(f"[*] Search cache hit: '{keyword}' (year={year}) -> {len(journals)} journal(s)")
+                    return journals
+
+        # Network request
         params = {"year": year, "keyword": keyword}
         print(f"[*] Searching for '{keyword}' (year={year})...")
         response = self._get(self.SEARCH_URL, params=params)
-        return self._parse_search_results(response.text, year)
+        results = self._parse_search_results(response.text, year)
+
+        # Save to cache
+        if self.cache and results:
+            self.cache.save_search_results(cache_key, [r["journal_id"] for r in results if r.get("journal_id")])
+
+        return results
+
+    def _cached_to_result(self, cached: dict) -> dict:
+        """Convert cached journal dict to search result dict."""
+        return {
+            "name": cached.get("name", ""),
+            "issn": cached.get("issn", ""),
+            "eissn": cached.get("eissn", ""),
+            "journal_id": cached.get("journal_id", ""),
+            "detail_url": cached.get("detail_url", ""),
+            "year": 2026,
+        }
 
     def _parse_search_results(self, html: str, year: int) -> list[dict]:
         """Parse the search results page."""
@@ -400,15 +622,37 @@ class XRScholarScraper:
 
     def list_major_categories(self, year: int = 2026) -> list[dict]:
         """List all major categories (大类学科)."""
+        cache_key = f"cat_list:ZKY:{year}"
+        if self.cache:
+            cached = self.cache.get_category_list(cache_key, self.cache_ttl)
+            if cached is not None:
+                print(f"[*] Category list cache hit: major categories ({year})")
+                return cached
+
         print(f"[*] Fetching major categories (year={year})...")
         response = self._get(self.CATEGORY_MAJOR_URL)
-        return self._parse_category_list(response.text, year, "ZKY")
+        cats = self._parse_category_list(response.text, year, "ZKY")
+
+        if self.cache:
+            self.cache.save_category_list(cache_key, cats)
+        return cats
 
     def list_minor_categories(self, year: int = 2026) -> list[dict]:
         """List all minor categories (小类学科)."""
+        cache_key = f"cat_list:JCR:{year}"
+        if self.cache:
+            cached = self.cache.get_category_list(cache_key, self.cache_ttl)
+            if cached is not None:
+                print(f"[*] Category list cache hit: minor categories ({year})")
+                return cached
+
         print(f"[*] Fetching minor categories (year={year})...")
         response = self._get(self.CATEGORY_MINOR_URL)
-        return self._parse_category_list(response.text, year, "JCR")
+        cats = self._parse_category_list(response.text, year, "JCR")
+
+        if self.cache:
+            self.cache.save_category_list(cache_key, cats)
+        return cats
 
     def _parse_category_list(self, html: str, year: int, cat_type: str) -> list[dict]:
         """Parse category list page (handles pagination)."""
@@ -503,6 +747,23 @@ class XRScholarScraper:
         Returns:
             List of journal dicts from the category listing
         """
+        cache_key = f"cat:{cat_type}:{category_id}:{year}:{keyword}:{page_size}"
+
+        # Check cache
+        if self.cache:
+            cached_ids = self.cache.get_category_results(cache_key, self.cache_ttl)
+            if cached_ids is not None:
+                journals = []
+                for jid in cached_ids:
+                    cached = self.cache.get_journal(jid, self.cache_ttl)
+                    if cached:
+                        journals.append(self._cached_to_result(cached))
+                    else:
+                        break
+                else:
+                    print(f"[*] Category cache hit: '{category_id}' ({cat_type}, year={year}) -> {len(journals)} journal(s)")
+                    return journals
+
         base = self.CATEGORY_MAJOR_URL if cat_type == "ZKY" else self.CATEGORY_MINOR_URL
         base_url = f"{base}/Journals/{year}/{category_id}"
 
@@ -527,6 +788,11 @@ class XRScholarScraper:
             page += 1
 
         print(f"[+] Found {len(all_journals)} journal(s) in category")
+
+        # Save to cache
+        if self.cache and all_journals:
+            self.cache.save_category_results(cache_key, [j["journal_id"] for j in all_journals if j.get("journal_id")])
+
         return all_journals
 
     def _parse_category_journals(self, html: str, year: int, cat_type: str, current_page: int = 1) -> tuple[list[dict], bool]:
@@ -608,10 +874,72 @@ class XRScholarScraper:
 
     def get_journal_detail(self, journal_id: str, year: int = 2026) -> Optional[Journal]:
         """Fetch detailed information for a specific journal."""
+        # Check cache
+        if self.cache:
+            cached = self.cache.get_journal(journal_id, self.cache_ttl)
+            if cached:
+                print(f"[*] Journal detail cache hit: {journal_id}")
+                return self._cached_to_journal(cached)
+
         url = urljoin(self.BASE_URL, f"/Journals/{journal_id}")
         print(f"[*] Fetching details for journal ID: {journal_id}...")
         response = self._get(url)
-        return self._parse_journal_detail(response.text, url)
+        journal = self._parse_journal_detail(response.text, url)
+
+        # Save to cache
+        if self.cache and journal:
+            self.cache.save_journal(journal_id, self._journal_to_cache_data(journal))
+
+        return journal
+
+    def _cached_to_journal(self, cached: dict) -> Journal:
+        """Convert cached dict to Journal object."""
+        import json as _json
+        minors_data = _json.loads(cached.get("minor_categories", "[]")) if cached.get("minor_categories") else []
+        return Journal(
+            name=cached.get("name", ""),
+            issn=cached.get("issn", ""),
+            eissn=cached.get("eissn", ""),
+            publisher=cached.get("publisher", ""),
+            language=cached.get("language", ""),
+            database_indexing=cached.get("database_indexing", ""),
+            major_category=MajorCategory(
+                english_name=cached.get("major_en", ""),
+                chinese_name=cached.get("major_cn", ""),
+                partition=cached.get("major_partition", ""),
+                is_top=bool(cached.get("major_is_top", 0)),
+            ),
+            minor_categories=[
+                MinorCategory(**m) for m in minors_data
+            ],
+            detail_url=cached.get("detail_url", ""),
+            journal_id=cached.get("journal_id", ""),
+        )
+
+    def _journal_to_cache_data(self, journal: Journal) -> dict:
+        """Convert Journal object to cache dict."""
+        return {
+            "journal_id": journal.journal_id,
+            "name": journal.name,
+            "issn": journal.issn,
+            "eissn": journal.eissn,
+            "publisher": journal.publisher,
+            "language": journal.language,
+            "database_indexing": journal.database_indexing,
+            "major_en": journal.major_category.english_name,
+            "major_cn": journal.major_category.chinese_name,
+            "major_partition": journal.major_category.partition,
+            "major_is_top": journal.major_category.is_top,
+            "minor_categories": [
+                {
+                    "english_name": m.english_name,
+                    "chinese_name": m.chinese_name,
+                    "partition": m.partition,
+                }
+                for m in journal.minor_categories
+            ],
+            "detail_url": journal.detail_url,
+        }
 
     def _parse_journal_detail(self, html: str, url: str) -> Optional[Journal]:
         """Parse the journal detail page."""
@@ -1005,6 +1333,10 @@ Examples:
 
   # Export filtered results to CSV
   %(prog)s --category-major "医学" --keyword "1区 AND Top" --output csv -f medicine_top.csv
+
+  # Cache management
+  %(prog)s --cache-stats
+  %(prog)s --clear-cache
         """,
     )
 
@@ -1019,10 +1351,37 @@ Examples:
     parser.add_argument("--category-minor", "-m", help="Minor category name (小类), e.g. 'COMPUTER SCIENCE, ARTIFICIAL INTELLIGENCE'")
     parser.add_argument("--page-size", "-ps", type=int, default=100, choices=[10, 20, 50, 100], help="Items per page for category browse (default: 100)")
     parser.add_argument("--list-categories", "-l", action="store_true", help="List all available categories and exit")
+    parser.add_argument("--cache-stats", action="store_true", help="Show cache statistics and exit")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear all cached data and exit")
+    parser.add_argument("--no-cache", action="store_true", help="Disable caching for this run")
+    parser.add_argument("--cache-ttl", type=int, default=86400, help="Cache TTL in seconds (default: 86400 = 24h)")
 
     args = parser.parse_args()
 
-    scraper = XRScholarScraper(timeout=args.timeout, delay=args.delay)
+    # Cache management commands
+    cache = None if args.no_cache else CacheManager()
+
+    if args.cache_stats:
+        if cache:
+            stats = cache.stats()
+            print("=== Cache Statistics ===")
+            print(f"  Journals:        {stats['journals']}")
+            print(f"  Search queries:  {stats['searches']}")
+            print(f"  Category queries: {stats['categories']}")
+            print(f"  Category lists:  {stats['category_lists']}")
+            print(f"  Database size:   {stats['size_mb']} MB")
+        else:
+            print("Cache is disabled.")
+        sys.exit(0)
+
+    if args.clear_cache:
+        if cache:
+            cache.clear()
+        else:
+            print("Cache is disabled.")
+        sys.exit(0)
+
+    scraper = XRScholarScraper(timeout=args.timeout, delay=args.delay, cache=cache, cache_ttl=args.cache_ttl)
 
     try:
         # List categories mode
