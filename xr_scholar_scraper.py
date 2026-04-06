@@ -1334,6 +1334,10 @@ Examples:
   # Export filtered results to CSV
   %(prog)s --category-major "医学" --keyword "1区 AND Top" --output csv -f medicine_top.csv
 
+  # Fetch ALL journals (no filters)
+  %(prog)s --fast
+  %(prog)s --prefetch
+
   # Prefetch: fetch ALL matching journals and cache details
   %(prog)s --category-major "计算机科学" --prefetch
   %(prog)s --category-major "计算机科学" --keyword "1区 AND Top" --prefetch
@@ -1406,8 +1410,8 @@ Examples:
         has_major = bool(args.category_major and args.category_major.strip())
         has_minor = bool(args.category_minor and args.category_minor.strip())
 
-        if not has_keyword and not has_major and not has_minor:
-            parser.error("At least one of --keyword, --category-major, or --category-minor is required.")
+        # No filters = fetch ALL journals across all major categories
+        fetch_all = not has_keyword and not has_major and not has_minor
 
         # Prefetch mode: always fetch all details and cache, regardless of --fast
         if args.prefetch:
@@ -1418,7 +1422,38 @@ Examples:
 
         journals = []
 
-        if has_major or has_minor:
+        if fetch_all:
+            # Fetch ALL journals across all major categories
+            cats = scraper.list_major_categories(args.year)
+            for c in cats:
+                print(f"[*] Fetching all journals from {c['chinese_name']} ({c['english_name']})...")
+                results = scraper.browse_category(c["category_id"], "ZKY", args.year, "", args.page_size)
+                if args.prefetch:
+                    print(f"[*] Prefetching {len(results)} journal details...")
+                    all_j = scraper._resolve_journals(results, args.year)
+                    journals.extend(all_j)
+                elif args.fast:
+                    journals.extend(_results_to_journals(results))
+                else:
+                    journals.extend(scraper._resolve_journals(results, args.year))
+
+            # Deduplicate
+            seen = set()
+            unique = []
+            for j in journals:
+                key = j.journal_id or j.detail_url
+                if key and key not in seen:
+                    seen.add(key)
+                    unique.append(j)
+                elif not key:
+                    unique.append(j)
+            journals = unique
+
+            if args.prefetch:
+                print(f"[+] Prefetch complete: {len(journals)} journal(s) fetched and cached.")
+                args.fast = orig_fast
+
+        elif has_major or has_minor:
             # Category browse mode
             if has_major:
                 # Find category ID by name
